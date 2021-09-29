@@ -1,0 +1,148 @@
+---
+orbs:
+  azure-cli: circleci/azure-cli@1.0.0
+  slack: circleci/slack@4.4.4
+version: 2.1
+
+parameters:
+  static_web_storage_account_name:
+    type: string
+    default: "sawebstest"
+  resource_group_name:
+    type: string
+    default: "WEBSTEST"
+  backend_container_name:
+    type: string
+    default: "edde-platform-deployment"
+  circleci_vcs_type:
+    type: string
+    default: github
+  circleci_organization:
+    type: string
+    default: greyshore
+  cohort_context_name:
+    type: string
+    default: cohort-template
+
+executors:
+  docker-executor:
+    docker:
+      - image: cimg/python:3.9.6
+jobs:
+  plan:
+    working_directory: ~/project
+    environment:
+      ARM_CLIENT_ID: dd66148a-c62e-4995-918f-384275fffa0a
+      ARM_SUBSCRIPTION_ID: fec422e4-40ce-401c-a664-965211904b08
+      ARM_TENANT_ID: 5a7488ef-bfb1-464f-ae6f-d2a9f14cd609
+    executor: docker-executor
+    steps:
+      - checkout
+      - azure-cli/install
+      - run:
+          executor: azure-cli/default
+          command: az -v
+          name: Verify Azure CLI is installed
+      - azure-cli/login-with-service-principal
+      - run:
+          command: |
+            sudo apt-get update && sudo apt-get install -y gnupg software-properties-common curl
+            curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+            sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+            sudo apt-get update && sudo apt-get install terraform
+          name: Install Terraform
+      - run:
+          name: terraform init & plan
+          command: |
+            terraform init -input=false \
+            -backend-config="container_name=<< pipeline.parameters.backend_container_name >>" \
+            -backend-config="key=webstest.tfstate"
+
+            terraform plan -var static_web_storage_account_name=<< pipeline.parameters.static_web_storage_account_name >> \
+            -var resource_group_name=<< pipeline.parameters.resource_group_name >> \
+            -out tf.plan
+      - run:
+          name: Install Terraform-Compliance Dependencies
+          command: sudo apt-get install libxslt-dev libxml2-dev
+      - run:
+          name: Install Terraform-Compliance
+          command: pip3 install -r requirements.txt
+      - run:
+          name: Run Terraform Compliance Check
+          command: terraform-compliance -f features -p tf.plan -S
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - tf.plan
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+
+  apply:
+    working_directory: ~/project
+    environment:
+      ARM_CLIENT_ID: dd66148a-c62e-4995-918f-384275fffa0a
+      ARM_SUBSCRIPTION_ID: fec422e4-40ce-401c-a664-965211904b08
+      ARM_TENANT_ID: 5a7488ef-bfb1-464f-ae6f-d2a9f14cd609
+    executor: docker-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/project
+      - azure-cli/install
+      - run:
+          executor: azure-cli/default
+          command: az -v
+          name: Verify Azure CLI is installed
+      - azure-cli/login-with-service-principal
+      - run:
+          command: |
+            sudo apt-get update && sudo apt-get install -y gnupg software-properties-common curl
+            curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+            sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+            sudo apt-get update && sudo apt-get install terraform
+          name: Install Terraform
+      - run:
+          name: terraform init and apply
+          command: |
+            terraform init -input=false \
+            -backend-config="container_name=<< pipeline.parameters.backend_container_name >>" \
+            -backend-config="key=webstest.tfstate"
+
+            terraform apply \
+              --auto-approve tf.plan
+      - run:
+          name: Set context variables for Static Web SAS
+          command: |
+            SAS_TOKEN=$(terraform output -raw static_web_container_sas_url_query_string)
+            python circleci.py "$de_circleci_api_token" "gh/<< pipeline.parameters.circleci_organization >>" "<< pipeline.parameters.cohort_context_name >>" "AZURE_STORAGE_SAS_TOKEN" "$SAS_TOKEN"
+            python circleci.py "$de_circleci_api_token" "gh/<< pipeline.parameters.circleci_organization >>" "<< pipeline.parameters.cohort_context_name >>" "AZURE_STORAGE_ACCOUNT" "<< pipeline.parameters.static_web_storage_account_name >>"
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+workflows:
+  version: 2
+  Terraform Plan and Apply:
+    jobs:
+      - plan:
+          context:
+            - greyshore-sandbox
+            - slack-secrets
+      - slack/on-hold:
+          context: slack-secrets
+          requires:
+            - plan
+      - request approval:
+          type: approval
+          requires:
+            - plan
+            - slack/on-hold
+      - apply:
+          requires:
+            - request approval
+          context:
+            - authorized-approvers
+            - greyshore-sandbox
+            - circleci
+            - slack-secrets
+            - circleci-context-management
